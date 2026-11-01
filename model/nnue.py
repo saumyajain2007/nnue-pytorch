@@ -55,8 +55,7 @@ def calculate_sf_loss(scorenet, score, outcome, loss_params, actual_lambda):
         decay=loss_params.tb_remap_decay,
     )
 
-    # convert the network and search scores to an estimate match result
-    # based on the win_rate_model, with scalings and offsets optimized
+    # Convert network and search scores into estimated match results.
     q = (scorenet - loss_params.in_offset) / loss_params.in_scaling
     qm = (-scorenet - loss_params.in_offset) / loss_params.in_scaling
     qf = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid())
@@ -65,20 +64,41 @@ def calculate_sf_loss(scorenet, score, outcome, loss_params, actual_lambda):
     sm = (-score - loss_params.out_offset) / loss_params.out_scaling
     pf = 0.5 * (1.0 + s.sigmoid() - sm.sigmoid())
 
-    # blend that eval based score with the actual game outcome
+    # Actual game outcome: win = 1, draw = 0.5, loss = 0.
     t = outcome
 
+    # Blend search-derived targets with actual game outcomes.
     pt = pf * actual_lambda + t * (1.0 - actual_lambda)
 
-    # use a MSE-like loss function
-    loss = torch.pow(torch.abs(pt - qf), loss_params.pow_exp)
-    if loss_params.qp_asymmetry != 0.0:
-        loss = loss * ((qf > pt) * loss_params.qp_asymmetry + 1)
+    # Original Stockfish-style power-law loss.
+    search_loss = torch.abs(pt - qf).pow(loss_params.pow_exp)
 
+    # Preserve the original asymmetric penalty.
+    if loss_params.qp_asymmetry != 0.0:
+        search_loss = search_loss * (
+            (qf > pt) * loss_params.qp_asymmetry + 1
+        )
+
+    # Original confidence-dependent sample weighting.
     weights = 1 + (2.0**loss_params.w1 - 1) * torch.pow(
-        (pf - 0.5) ** 2 * pf * (1 - pf), loss_params.w2
+        (pf - 0.5) ** 2 * pf * (1 - pf),
+        loss_params.w2,
     )
-    loss = (loss * weights).sum() / weights.sum()
+
+    # NEW: Auxiliary outcome-calibration objective.
+    # Penalise disagreement between predicted result and actual outcome.
+    outcome_loss = (qf - t).square()
+
+    # Experimental coefficient; tune through controlled experiments.
+    outcome_aux_weight = 0.1
+
+    # Combine the original objective with the auxiliary objective.
+    combined_loss = (
+        search_loss + outcome_aux_weight * outcome_loss
+    )
+
+    # Preserve the original weighted-mean reduction.
+    loss = (combined_loss * weights).sum() / weights.sum()
 
     return loss
 
