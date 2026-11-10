@@ -409,6 +409,9 @@ class SimpleTrainer:
 
         total_val_loss = None
         num_val_batches = 0
+        # Any other "val_*" outputs (e.g. objective-independent metrics) are
+        # averaged the same way and logged as "<key>_epoch".
+        extra_val_totals: dict[str, torch.Tensor] = {}
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_loader):
@@ -430,6 +433,14 @@ class SimpleTrainer:
                     val_loss if total_val_loss is None else (total_val_loss + val_loss)
                 )
                 num_val_batches += 1
+                for key, value in outputs.items():
+                    if key == "val_loss" or not key.startswith("val_"):
+                        continue
+                    if not torch.is_tensor(value):
+                        value = torch.tensor(value, device=self.device)
+                    value = value.detach().float()
+                    prev = extra_val_totals.get(key)
+                    extra_val_totals[key] = value if prev is None else prev + value
 
                 self._call_callbacks(
                     "on_validation_batch_end", self, batch, batch_idx, outputs
@@ -446,9 +457,22 @@ class SimpleTrainer:
             mean_tensor /= self.world_size
             mean_val_loss = mean_tensor.item()
 
+        extra_val_means: dict[str, float] = {}
+        for key, total in extra_val_totals.items():
+            mean = total / num_val_batches
+            if self.world_size > 1:
+                dist.all_reduce(mean, op=dist.ReduceOp.SUM)
+                mean /= self.world_size
+            extra_val_means[f"{key}_epoch"] = mean.item()
+
         self.callback_metrics["val_loss_epoch"] = mean_val_loss
+        self.callback_metrics.update(extra_val_means)
         self._log_metrics(
-            {"val_loss_epoch": mean_val_loss, "epoch": self.current_epoch},
+            {
+                "val_loss_epoch": mean_val_loss,
+                **extra_val_means,
+                "epoch": self.current_epoch,
+            },
             step=self.global_step,
         )
 
