@@ -192,6 +192,38 @@ it across DDP ranks, and logs it as `<key>_epoch` next to `val_loss_epoch`.
 
 ---
 
+## 2b. Fitted per-phase lambda: `--lambda-phase-table` (experimental)
+
+Instead of the straight line of `--lambda-phase-delta`, take one lambda per
+piece count from a JSON table (`{"lambda_by_piece_count": [33 values]}`). The
+table replaces the scheduled lambda; it cannot be combined with
+`--lambda-phase-delta`.
+
+`scripts/fit_phase_lambda.py` fits the table from data. It treats the search
+score `p` and the game result `t` as noisy estimates of the true value, and
+picks the inverse-variance blend `lambda = var_t / (var_p + var_t)` per piece
+count. The variances come from *triple collocation*, which uses a third
+estimate `q` (a net's prediction) and assumes all three errors are mutually
+uncorrelated (math in `model/phase_lambda.py`).
+
+### Result of the first trial: the assumption fails with a lambda = 1 net
+
+Fitted on 4M training positions with `A_baseline` (fine-tuned at lambda = 1)
+as `q`, the estimated search variance came out **negative at every piece
+count**, and every lambda clamped to 1.0. A negative variance means the
+assumption is badly violated: a net trained to imitate the search shares the
+search's errors, so `p - q` is small and the estimator breaks down. The
+resulting table would just reproduce the baseline, so it was not trained.
+
+What the trial *did* show: the search/outcome disagreement grows by about
+50x with material, from about 0.0002 (3 pieces) to 0.009 (8), 0.026 (16) and
+0.051 (32). This is consistent with game results being much noisier labels
+early in the game, which is the premise of change 2.
+
+To make the fit usable, `q` must have errors independent of the search, for
+example a net trained only on game results (lambda = 0) and evaluated on
+held-out data. That is untested.
+
 ## Suggested benchmark
 
 Use identical data, seed, epochs, features and network size for every run,

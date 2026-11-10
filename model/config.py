@@ -66,6 +66,12 @@ class LambdaConfig:
     0 at the starting position, the full delta with only the kings left.
     Negative values lean on game results in endgames, where the result is a
     much less noisy label than in the opening. 0.0 disables (default)."""
+    lambda_phase_table: str | None = None
+    """Path to a JSON lambda table with one value per piece count (0..32),
+    e.g. produced by scripts/fit_phase_lambda.py. When set, each sample's
+    lambda is looked up by its piece count and replaces the scheduled lambda
+    (start/end/cycle/jitter settings are then ignored). Cannot be combined
+    with lambda_phase_delta."""
 
     def __post_init__(self):
         if (self.start_lambda is not None) != (self.end_lambda is not None):
@@ -81,6 +87,8 @@ class LambdaConfig:
             raise ValueError("jitter_decay_lambda_batch must be in the range [0.0, 1.0).")
         if not -1.0 <= self.lambda_phase_delta <= 1.0:
             raise ValueError("lambda_phase_delta must be in the range [-1.0, 1.0].")
+        if self.lambda_phase_table is not None and self.lambda_phase_delta != 0.0:
+            raise ValueError("lambda_phase_table and lambda_phase_delta are mutually exclusive.")
         if self.jitter_lambda_batch < 0.0 or self.jitter_lambda_sample < 0.0:
             raise ValueError("jitter_lambda_batch and jitter_lambda_sample must be non-negative.")
         if self.lambda_schedule_steps >= 0:

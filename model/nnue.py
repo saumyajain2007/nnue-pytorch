@@ -7,6 +7,7 @@ from torchmetrics import MeanMetric, MetricCollection
 from .config import NNUELightningConfig
 from .lambda_utils import LambdaController
 from .model import NNUEModel
+from .phase_lambda import load_lambda_table, lookup_lambda
 
 
 def _get_parameters(layers: list[nn.Module], get_biases: bool = False):
@@ -153,6 +154,15 @@ class NNUE(nn.Module):
 
         # Initialize the lambda controller
         self.lambda_scheduler = LambdaController()
+
+        # Optional per-piece-count lambda table (--lambda-phase-table). Not
+        # persistent: checkpoints stay loadable without the table file.
+        table_path = config.loss_params.lambda_config.lambda_phase_table
+        self.register_buffer(
+            "lambda_phase_table",
+            load_lambda_table(table_path) if table_path is not None else None,
+            persistent=False,
+        )
 
         self.loss_metrics = MetricCollection(
             {
@@ -419,6 +429,10 @@ class NNUE(nn.Module):
             is_training=self.training,
             scorenet=scorenet,
         )
+
+        # Per-piece-count lambda table replaces the scheduled lambda.
+        if self.lambda_phase_table is not None:
+            actual_lambda = lookup_lambda(self.lambda_phase_table, piece_count, scorenet)
 
         # Phase-dependent lambda. Applied in training and validation alike:
         # it is part of the objective, not a regulariser like jitter.
