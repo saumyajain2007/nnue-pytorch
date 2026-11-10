@@ -372,6 +372,9 @@ class SimpleTrainer:
 
         total_val_loss = 0.0
         num_val_batches = 0
+        # Any other "val_*" outputs (e.g. objective-independent metrics) are
+        # averaged the same way and logged as "<key>_epoch".
+        extra_val_totals: dict[str, float] = {}
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_loader):
@@ -382,6 +385,9 @@ class SimpleTrainer:
                 outputs = self.model.val_step(batch, self.current_epoch, self.global_step)
                 total_val_loss += float(outputs["val_loss"])
                 num_val_batches += 1
+                for key, value in outputs.items():
+                    if key != "val_loss" and key.startswith("val_"):
+                        extra_val_totals[key] = extra_val_totals.get(key, 0.0) + float(value)
 
                 self._call_callbacks("on_validation_batch_end", self, batch, batch_idx, outputs)
 
@@ -395,9 +401,19 @@ class SimpleTrainer:
             mean_tensor /= self.world_size
             mean_val_loss = mean_tensor.item()
 
+        extra_val_means: dict[str, float] = {}
+        for key, total in extra_val_totals.items():
+            mean = total / num_val_batches if num_val_batches > 0 else float("nan")
+            if self.world_size > 1:
+                t = torch.tensor(mean, device=self.device)
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                mean = (t / self.world_size).item()
+            extra_val_means[f"{key}_epoch"] = mean
+
         self.callback_metrics["val_loss_epoch"] = mean_val_loss
+        self.callback_metrics.update(extra_val_means)
         self._log_metrics(
-            {"val_loss_epoch": mean_val_loss, "epoch": self.current_epoch},
+            {"val_loss_epoch": mean_val_loss, **extra_val_means, "epoch": self.current_epoch},
             step=self.global_step,
         )
 

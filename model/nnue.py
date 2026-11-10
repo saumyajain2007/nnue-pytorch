@@ -1,3 +1,5 @@
+import dataclasses
+
 import torch
 from torch import Tensor, nn
 from torchmetrics import MeanMetric, MetricCollection
@@ -36,38 +38,85 @@ def remap_tablebase_score(
     return torch.where(is_mate, remapped_score, score)
 
 
+def expected_score(x: Tensor, offset: float, scaling: float) -> Tensor:
+    """Map a centipawn-like score to an expected game result in [0, 1].
+
+    This is the symmetric two-sigmoid win-rate model the trainer has always
+    used; it is factored out so the loss and the validation metrics share it.
+    """
+    p = (x - offset) / scaling
+    pm = (-x - offset) / scaling
+    return 0.5 * (1.0 + p.sigmoid() - pm.sigmoid())
+
+
 def calculate_sf_loss(scorenet, score, outcome, loss_params, actual_lambda):
     score = remap_tablebase_score(
         score,
         base=loss_params.tb_remap_base,
         scale=loss_params.tb_remap_scale,
-        decay=loss_params.tb_remap_decay
+        decay=loss_params.tb_remap_decay,
     )
 
-    # convert the network and search scores to an estimate match result
-    # based on the win_rate_model, with scalings and offsets optimized
-    q = (scorenet - loss_params.in_offset) / loss_params.in_scaling
-    qm = (-scorenet - loss_params.in_offset) / loss_params.in_scaling
-    qf = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid())
+    # Convert network and search scores into expected match results.
+    qf = expected_score(scorenet, loss_params.in_offset, loss_params.in_scaling)
+    pf = expected_score(score, loss_params.out_offset, loss_params.out_scaling)
 
-    s = (score - loss_params.out_offset) / loss_params.out_scaling
-    sm = (-score - loss_params.out_offset) / loss_params.out_scaling
-    pf = 0.5 * (1.0 + s.sigmoid() - sm.sigmoid())
-
-    # blend that eval based score with the actual game outcome
+    # Actual game outcome: win = 1, draw = 0.5, loss = 0.
     t = outcome
 
+    # Blend search-derived targets with game outcomes (actual_lambda may be a
+    # scalar or per sample, e.g. with jitter or --lambda-phase-delta).
     pt = pf * actual_lambda + t * (1.0 - actual_lambda)
 
-    # use a MSE-like loss function
+    # Stockfish-style power-law loss, with optional asymmetric penalty.
     loss = torch.pow(torch.abs(pt - qf), loss_params.pow_exp)
     if loss_params.qp_asymmetry != 0.0:
         loss = loss * ((qf > pt) * loss_params.qp_asymmetry + 1)
 
-    weights = 1 + (2.0**loss_params.w1 - 1) * torch.pow((pf - 0.5) ** 2 * pf * (1 - pf), loss_params.w2)
+    # Auxiliary outcome-calibration term (first introduced in b882e6c with a
+    # hard-coded weight of 0.1). The Python-level branch keeps the original
+    # loss bit-exact when it is disabled.
+    if loss_params.outcome_aux_weight != 0.0:
+        loss = loss + loss_params.outcome_aux_weight * (qf - t).square()
+
+    # Confidence-dependent sample weighting.
+    weights = 1 + (2.0**loss_params.w1 - 1) * torch.pow(
+        (pf - 0.5) ** 2 * pf * (1 - pf), loss_params.w2
+    )
     loss = (loss * weights).sum() / weights.sum()
 
     return loss
+
+
+def apply_phase_lambda(actual_lambda, piece_count: Tensor, delta: float, like: Tensor) -> Tensor:
+    """Shift lambda per sample by ``delta * phase`` where phase goes 0 -> 1
+    from 32 pieces down to 2 pieces (bare kings).
+
+    ``piece_count`` may arrive as (B,) or (B, 1) while scores are (B, 1); it
+    is reshaped explicitly so the two never broadcast into a (B, B) matrix.
+    """
+    pc = piece_count.to(like.dtype).reshape(like.shape)
+    phase = ((32.0 - pc) / 30.0).clamp(0.0, 1.0)
+    return (actual_lambda + delta * phase).clamp(0.0, 1.0)
+
+
+@torch.no_grad()
+def calculate_reference_metrics(scorenet: Tensor, score: Tensor, outcome: Tensor, loss_params) -> dict[str, Tensor]:
+    """Validation metrics that do not depend on the training objective.
+
+    * ``ref_loss``: the original SF loss at lambda = 1 with no auxiliary term
+      (fit to search scores).
+    * ``outcome_mse``: unweighted mean of (expected_score(net) - result)^2,
+      the Brier score of the net against the game result.
+
+    ``ref_loss`` still uses pow_exp / qp_asymmetry / w1 / w2 and the scaling
+    constants from ``loss_params``, so only compare runs that share them.
+    """
+    ref_params = dataclasses.replace(loss_params, outcome_aux_weight=0.0)
+    ref_loss = calculate_sf_loss(scorenet, score, outcome, ref_params, 1.0)
+    qf = expected_score(scorenet, loss_params.in_offset, loss_params.in_scaling)
+    outcome_mse = (qf - outcome).square().mean()
+    return {"ref_loss": ref_loss, "outcome_mse": outcome_mse}
 
 
 class NNUE(nn.Module):
@@ -302,9 +351,20 @@ class NNUE(nn.Module):
     @torch.no_grad()
     def val_step(self, batch, current_epoch, global_step):
         _ = current_epoch
-        loss = self.compute_loss(batch, global_step)
+        scorenet = self._forward_batch(batch)
+        loss = self.compute_loss_with_scorenet(scorenet, batch, global_step)
         self.loss_metrics["val_loss_epoch"].update(loss)
-        return {"val_loss": loss}
+
+        outputs = {"val_loss": loss}
+        _us, _them, _wi, _bi, outcome, score, *_rest = batch
+        ref = calculate_reference_metrics(
+            scorenet * self.model.quantization.nnue2score,
+            score,
+            outcome,
+            self.config.loss_params,
+        )
+        outputs.update({f"val_{k}": v for k, v in ref.items()})
+        return outputs
 
     @torch.no_grad()
     def test_step(self, batch, current_epoch, global_step):
@@ -313,7 +373,7 @@ class NNUE(nn.Module):
         self.loss_metrics["test_loss_epoch"].update(loss)
         return {"test_loss": loss}
 
-    def compute_loss(self, batch: tuple[Tensor, ...], current_step: int):
+    def _forward_batch(self, batch: tuple[Tensor, ...]) -> Tensor:
         (
             us,
             them,
@@ -323,7 +383,7 @@ class NNUE(nn.Module):
             _score,
             piece_count,
         ) = batch
-        scorenet = self.model(
+        return self.model(
             us,
             them,
             white_indices,
@@ -332,6 +392,9 @@ class NNUE(nn.Module):
             self.config.use_fake_act_quantization,
             self.config.use_fake_weight_quantization,
         )
+
+    def compute_loss(self, batch: tuple[Tensor, ...], current_step: int):
+        scorenet = self._forward_batch(batch)
         return self.compute_loss_with_scorenet(scorenet, batch, current_step)
 
     def compute_loss_with_scorenet(
@@ -344,7 +407,7 @@ class NNUE(nn.Module):
             _black_indices,
             outcome,
             score,
-            _piece_count,
+            piece_count,
         ) = batch
 
         scorenet = scorenet * self.model.quantization.nnue2score
@@ -356,6 +419,12 @@ class NNUE(nn.Module):
             is_training=self.training,
             scorenet=scorenet,
         )
+
+        # Phase-dependent lambda. Applied in training and validation alike:
+        # it is part of the objective, not a regulariser like jitter.
+        phase_delta = self.config.loss_params.lambda_config.lambda_phase_delta
+        if phase_delta != 0.0:
+            actual_lambda = apply_phase_lambda(actual_lambda, piece_count, phase_delta, scorenet)
 
         sf_loss = calculate_sf_loss(
             scorenet, score, outcome, self.config.loss_params, actual_lambda

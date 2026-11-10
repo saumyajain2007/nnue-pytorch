@@ -60,6 +60,12 @@ class LambdaConfig:
     """The maximum delta added to the linear lambda change during the peak of the cycle."""
     lambda_cycle_jitter: bool = False
     """If True, the lambda jitter (both batch and sample) will be scaled by the cosine factor (0 to 1) of the cycle."""
+    lambda_phase_delta: float = 0.0
+    """Per-sample lambda offset that grows as material comes off the board:
+    lambda += delta * (32 - piece_count) / 30, then clamped to [0, 1].
+    0 at the starting position, the full delta with only the kings left.
+    Negative values lean on game results in endgames, where the result is a
+    much less noisy label than in the opening. 0.0 disables (default)."""
 
     def __post_init__(self):
         if (self.start_lambda is not None) != (self.end_lambda is not None):
@@ -73,6 +79,8 @@ class LambdaConfig:
 
         if self.jitter_decay_lambda_batch < 0.0 or self.jitter_decay_lambda_batch >= 1.0:
             raise ValueError("jitter_decay_lambda_batch must be in the range [0.0, 1.0).")
+        if not -1.0 <= self.lambda_phase_delta <= 1.0:
+            raise ValueError("lambda_phase_delta must be in the range [-1.0, 1.0].")
         if self.jitter_lambda_batch < 0.0 or self.jitter_lambda_sample < 0.0:
             raise ValueError("jitter_lambda_batch and jitter_lambda_sample must be non-negative.")
         if self.lambda_schedule_steps >= 0:
@@ -109,6 +117,14 @@ class LossParams:
     """Tablebase score remapping scale value (default=20000.0)"""
     tb_remap_decay: float = 0.85
     """Tablebase score remapping decay parameter (default=0.8)"""
+    outcome_aux_weight: float = 0.0
+    """Weight of an auxiliary (q - outcome)^2 term added to the per-sample loss
+    before the confidence weighting. 0.0 disables it and reproduces the master
+    loss exactly. See docs/loss_experiments.md for how it relates to lambda."""
+
+    def __post_init__(self):
+        if self.outcome_aux_weight < 0.0:
+            raise ValueError("outcome_aux_weight must be non-negative.")
 
 @dataclass(kw_only=True)
 class NNUELightningConfig(FeatureConfig):
